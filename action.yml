@@ -395,7 +395,7 @@ runs:
           --statement-id "apigw-${API_ID}-invoke" \
           --action "lambda:InvokeFunction" \
           --principal apigateway.amazonaws.com \
-          --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/*" \
+          --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/$default" \
           --region "${AWS_REGION}" >/dev/null
 
         API_ENDPOINT="$(
