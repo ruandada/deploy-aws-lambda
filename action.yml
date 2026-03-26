@@ -1,0 +1,485 @@
+name: Deploy AWS Lambda Function
+description: Deploy AWS Lambda Function using Docker and GitHub Actions
+
+inputs:
+  build-function:
+    description: Target function directory name, e.g. aws-lambda-typescript-docker-starter
+    required: true
+  config-file:
+    description: Deployment config filename under build-function directory
+    required: false
+    default: aws-lambda.yaml
+
+outputs:
+  image-uri-latest:
+    description: Latest image URI pushed to ECR
+    value: ${{ steps.image-meta.outputs.image_uri_latest }}
+  image-uri-sha:
+    description: SHA-tagged image URI pushed to ECR
+    value: ${{ steps.image-meta.outputs.image_uri_sha }}
+  image-tag-sha:
+    description: Immutable image tag based on commit SHA
+    value: ${{ steps.image-meta.outputs.image_tag_sha }}
+  lambda-url:
+    description: Lambda Function URL
+    value: ${{ steps.summary.outputs.lambda_url }}
+  api-gateway-url:
+    description: API Gateway HTTP API endpoint
+    value: ${{ steps.summary.outputs.api_gateway_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Load deployment config from build-function
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        BUILD_FUNCTION="${{ inputs.build-function }}"
+        CONFIG_FILE="${{ inputs.config-file }}"
+        export BUILD_FUNCTION CONFIG_FILE GITHUB_ENV
+        python3 - <<'PY'
+        import os
+        import re
+        import sys
+        from pathlib import Path
+
+        build_function = os.environ["BUILD_FUNCTION"]
+        config_file = os.environ["CONFIG_FILE"]
+        config_path = Path(build_function) / config_file
+        print(f"Loading deployment config: {config_path}")
+
+        if not config_path.exists():
+            print(f"::error::Config file not found: {config_path}")
+            sys.exit(1)
+
+        text = config_path.read_text(encoding="utf-8")
+
+        # Prefer full YAML parser when available; fallback to flat key:value parser.
+        data = {}
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            yaml = None
+
+        if yaml is not None:
+            parsed = yaml.safe_load(text) or {}
+            if not isinstance(parsed, dict):
+                print(f"::error::Config root must be a map/object in {config_path}")
+                sys.exit(1)
+            data = parsed
+        else:
+            for raw_line in text.splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if raw_line.startswith((" ", "\t")):
+                    continue
+                match = re.match(r"^([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$", raw_line)
+                if not match:
+                    continue
+                key, value = match.groups()
+                if (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    value = value[1:-1]
+                data[key] = value
+
+        def get_value(key: str, required: bool = False, default: str = "") -> str:
+            value = data.get(key, default)
+            if value is None:
+                value = ""
+            value = str(value).strip()
+            if required and not value:
+                print(f"::error::Missing required key '{key}' in {config_path}")
+                sys.exit(1)
+            return value
+
+        function_name = get_value("FunctionName", required=True)
+        image_repository = get_value("ImageRepository", required=True)
+        aws_region = get_value("Region", required=True)
+        aws_account_id = get_value("AccountId", required=True)
+        deployment_role_name = get_value("DeploymentRoleName", required=True)
+        execution_role_name = get_value("ExecutionRoleName", required=True)
+        architecture = get_value("Architecture", default="x86_64")
+        dockerfile_path = get_value("DockerfilePath", default="Dockerfile")
+        api_gateway_name = get_value("ApiGatewayName", default=f"{function_name}-http-api")
+
+        env_lines = {
+            "FUNCTION_NAME": function_name,
+            "IMAGE_REPOSITORY": image_repository,
+            "DOCKER_BUILD_CONTEXT": build_function,
+            "AWS_REGION": aws_region,
+            "AWS_ACCOUNT_ID": aws_account_id,
+            "DEPLOYMENT_ROLE_NAME": deployment_role_name,
+            "EXECUTION_ROLE_NAME": execution_role_name,
+            "ARCHITECTURE": architecture,
+            "DOCKERFILE_PATH": dockerfile_path,
+            "API_GATEWAY_NAME": api_gateway_name,
+            "DEPLOYMENT_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{deployment_role_name}",
+            "EXECUTION_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{execution_role_name}",
+        }
+
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fp:
+            for k, v in env_lines.items():
+                fp.write(f"{k}={v}\n")
+        PY
+
+    - name: Validate critical inputs and paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        BUILD_FUNCTION="${{ inputs.build-function }}"
+        CONFIG_FILE="${{ inputs.config-file }}"
+        config_path="${BUILD_FUNCTION}/${CONFIG_FILE}"
+
+        fail() {
+          echo "::error::$1"
+          exit 1
+        }
+
+        echo "Validating deployment config loaded from ${config_path} ..."
+
+        # Required fields
+        [[ -n "${FUNCTION_NAME}" ]] || fail "FunctionName is required."
+        [[ -n "${IMAGE_REPOSITORY}" ]] || fail "ImageRepository is required."
+        [[ -n "${DOCKER_BUILD_CONTEXT}" ]] || fail "DockerContext is required."
+        [[ -n "${AWS_REGION}" ]] || fail "Region is required."
+        [[ -n "${AWS_ACCOUNT_ID}" ]] || fail "AccountId is required."
+        [[ -n "${DEPLOYMENT_ROLE_NAME}" ]] || fail "DeploymentRoleName is required."
+        [[ -n "${EXECUTION_ROLE_NAME}" ]] || fail "ExecutionRoleName is required."
+
+        # Basic format checks
+        [[ "${AWS_ACCOUNT_ID}" =~ ^[0-9]{12}$ ]] || fail "AccountId must be 12 digits."
+        [[ "${AWS_REGION}" =~ ^[a-z]{2}-[a-z]+-[0-9]{1}$ ]] || fail "Region format is invalid."
+        [[ "${ARCHITECTURE}" == "x86_64" || "${ARCHITECTURE}" == "arm64" ]] || fail "Architecture must be x86_64 or arm64."
+
+        # Docker inputs must be available before AWS operations.
+        if [[ ! -d "${DOCKER_BUILD_CONTEXT}" ]]; then
+          fail "DockerContext directory does not exist: ${DOCKER_BUILD_CONTEXT}"
+        fi
+
+        dockerfile_abs="${DOCKER_BUILD_CONTEXT}/${DOCKERFILE_PATH}"
+        if [[ ! -f "${dockerfile_abs}" ]]; then
+          fail "Dockerfile not found at: ${dockerfile_abs}"
+        fi
+
+        echo "Auth mode: OIDC assume-role."
+        echo "Validation passed."
+
+    - name: Prepare image tags
+      id: image-meta
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Publish two tags: mutable latest and immutable commit sha.
+        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_TAG_SHA="sha-${GITHUB_SHA::12}"
+        IMAGE_URI_LATEST="${ECR_REGISTRY}/${IMAGE_REPOSITORY}:latest"
+        IMAGE_URI_SHA="${ECR_REGISTRY}/${IMAGE_REPOSITORY}:${IMAGE_TAG_SHA}"
+
+        echo "ECR_REGISTRY=${ECR_REGISTRY}" >> "${GITHUB_ENV}"
+        echo "IMAGE_TAG_SHA=${IMAGE_TAG_SHA}" >> "${GITHUB_ENV}"
+        echo "IMAGE_URI_LATEST=${IMAGE_URI_LATEST}" >> "${GITHUB_ENV}"
+        echo "IMAGE_URI_SHA=${IMAGE_URI_SHA}" >> "${GITHUB_ENV}"
+
+        echo "image_tag_sha=${IMAGE_TAG_SHA}" >> "$GITHUB_OUTPUT"
+        echo "image_uri_latest=${IMAGE_URI_LATEST}" >> "$GITHUB_OUTPUT"
+        echo "image_uri_sha=${IMAGE_URI_SHA}" >> "$GITHUB_OUTPUT"
+
+    - name: Build Docker image (latest + sha)
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker build "${DOCKER_BUILD_CONTEXT}" \
+          -f "${DOCKER_BUILD_CONTEXT}/${DOCKERFILE_PATH}" \
+          -t "${IMAGE_URI_LATEST}" \
+          -t "${IMAGE_URI_SHA}"
+        echo "Built images:"
+        echo "  - ${IMAGE_URI_LATEST}"
+        echo "  - ${IMAGE_URI_SHA}"
+
+    - name: Configure AWS credentials
+      # Single auth path: short-lived credentials via GitHub OIDC.
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ env.DEPLOYMENT_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Ensure ECR repository exists
+      shell: bash
+      run: |
+        set -euo pipefail
+        # First-run safe: create repository only when missing.
+        if aws ecr describe-repositories --repository-names "${IMAGE_REPOSITORY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+          echo "ECR repository exists: ${IMAGE_REPOSITORY}"
+        else
+          echo "Creating ECR repository: ${IMAGE_REPOSITORY}"
+          aws ecr create-repository \
+            --repository-name "${IMAGE_REPOSITORY}" \
+            --region "${AWS_REGION}" >/dev/null
+        fi
+        # Ensure repo policy allows Lambda service to pull images for this function.
+        POLICY_JSON="$(
+          aws ecr get-repository-policy \
+            --repository-name "${IMAGE_REPOSITORY}" \
+            --region "${AWS_REGION}" \
+            --query 'policyText' \
+            --output text 2>/dev/null || true
+        )"
+        export POLICY_JSON AWS_REGION AWS_ACCOUNT_ID FUNCTION_NAME
+        MERGED_POLICY="$(
+          python3 - <<'PY'
+        import json
+        import os
+
+        raw = os.environ.get("POLICY_JSON", "")
+        if not raw or raw == "None":
+            doc = {"Version": "2012-10-17", "Statement": []}
+        else:
+            try:
+                doc = json.loads(raw)
+            except json.JSONDecodeError:
+                doc = {"Version": "2012-10-17", "Statement": []}
+
+        doc.setdefault("Version", "2012-10-17")
+        stmts = doc.get("Statement", [])
+        if isinstance(stmts, dict):
+            stmts = [stmts]
+
+        region = os.environ["AWS_REGION"]
+        account = os.environ["AWS_ACCOUNT_ID"]
+        function = os.environ["FUNCTION_NAME"]
+        sid = "LambdaEcrImageAccess"
+        source_arn = f"arn:aws:lambda:{region}:{account}:function:{function}*"
+
+        desired_stmt = {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+            "Condition": {"StringLike": {"aws:sourceArn": source_arn}},
+        }
+
+        replaced = False
+        for idx, stmt in enumerate(stmts):
+            if isinstance(stmt, dict) and stmt.get("Sid") == sid:
+                stmts[idx] = desired_stmt
+                replaced = True
+                break
+
+        if not replaced:
+            stmts.append(desired_stmt)
+
+        doc["Statement"] = stmts
+        print(json.dumps(doc, separators=(",", ":")))
+        PY
+        )"
+        aws ecr set-repository-policy \
+          --repository-name "${IMAGE_REPOSITORY}" \
+          --region "${AWS_REGION}" \
+          --policy-text "${MERGED_POLICY}" >/dev/null
+        echo "ECR repository policy ensured for Lambda image pull."
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Push image to ECR (latest + sha)
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker push "${IMAGE_URI_LATEST}"
+        docker push "${IMAGE_URI_SHA}"
+        echo "Pushed images:"
+        echo "  - ${IMAGE_URI_LATEST}"
+        echo "  - ${IMAGE_URI_SHA}"
+
+    - name: Ensure Lambda function exists
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # First-run safe: create function if absent.
+        if aws lambda get-function \
+          --function-name "${FUNCTION_NAME}" \
+          --region "${AWS_REGION}" >/dev/null 2>&1; then
+          echo "Lambda function exists: ${FUNCTION_NAME}"
+          echo "LAMBDA_EXISTS=true" >> "${GITHUB_ENV}"
+        else
+          echo "Creating Lambda function: ${FUNCTION_NAME}"
+          aws lambda create-function \
+            --function-name "${FUNCTION_NAME}" \
+            --package-type Image \
+            --code "ImageUri=${IMAGE_URI_LATEST}" \
+            --role "${EXECUTION_ROLE_ARN}" \
+            --architectures "${ARCHITECTURE}" \
+            --region "${AWS_REGION}" >/dev/null
+          echo "Lambda function created: ${FUNCTION_NAME}"
+          echo "LAMBDA_EXISTS=false" >> "${GITHUB_ENV}"
+        fi
+
+    - name: Update Lambda function image
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${LAMBDA_EXISTS}" != "true" ]]; then
+          echo "Function was just created. Skip update-function-code in this run."
+          exit 0
+        fi
+
+        # Existing function: point to the latest image tag after push.
+        echo "Updating function image to ${IMAGE_URI_LATEST}"
+        aws lambda update-function-code \
+          --function-name "${FUNCTION_NAME}" \
+          --image-uri "${IMAGE_URI_LATEST}" \
+          --region "${AWS_REGION}" >/dev/null
+
+    - name: Wait for Lambda update completion
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${LAMBDA_EXISTS}" == "true" ]]; then
+          aws lambda wait function-updated \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}"
+          echo "Lambda update completed."
+        else
+          aws lambda wait function-active \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}"
+          echo "Lambda create completed and function is active."
+        fi
+
+    - name: Ensure API Gateway trigger exists
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Idempotent behavior: if API exists by name, skip creation.
+        API_ID="$(
+          aws apigatewayv2 get-apis \
+            --region "${AWS_REGION}" \
+            --query "Items[?Name==\`${API_GATEWAY_NAME}\`].ApiId | [0]" \
+            --output text
+        )"
+
+        if [[ -n "${API_ID}" && "${API_ID}" != "None" ]]; then
+          echo "API Gateway exists, skip creating trigger: ${API_GATEWAY_NAME} (${API_ID})"
+          API_ENDPOINT="$(
+            aws apigatewayv2 get-api \
+              --api-id "${API_ID}" \
+              --region "${AWS_REGION}" \
+              --query 'ApiEndpoint' \
+              --output text
+          )"
+          echo "API_GATEWAY_URL=${API_ENDPOINT}" >> "${GITHUB_ENV}"
+          echo "API Endpoint: ${API_ENDPOINT}"
+          exit 0
+        fi
+
+        echo "Creating HTTP API Gateway trigger for Lambda: ${FUNCTION_NAME}"
+        API_ID="$(
+          aws apigatewayv2 create-api \
+            --name "${API_GATEWAY_NAME}" \
+            --protocol-type HTTP \
+            --target "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'ApiId' \
+            --output text
+        )"
+
+        # Grant invoke permission to this new API.
+        aws lambda add-permission \
+          --function-name "${FUNCTION_NAME}" \
+          --statement-id "apigw-${API_ID}-invoke" \
+          --action "lambda:InvokeFunction" \
+          --principal apigateway.amazonaws.com \
+          --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/*" \
+          --region "${AWS_REGION}" >/dev/null
+
+        API_ENDPOINT="$(
+          aws apigatewayv2 get-api \
+            --api-id "${API_ID}" \
+            --region "${AWS_REGION}" \
+            --query 'ApiEndpoint' \
+            --output text
+        )"
+        echo "API_GATEWAY_URL=${API_ENDPOINT}" >> "${GITHUB_ENV}"
+        echo "Created API Gateway trigger: ${API_GATEWAY_NAME} (${API_ID})"
+        echo "API Endpoint: ${API_ENDPOINT}"
+
+    - name: Verify deployed image URI
+      shell: bash
+      run: |
+        set -euo pipefail
+        CURRENT_IMAGE_URI="$(
+          aws lambda get-function \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'Code.ImageUri' \
+            --output text
+        )"
+        echo "Current Lambda image URI: ${CURRENT_IMAGE_URI}"
+        if [[ "${CURRENT_IMAGE_URI}" != "${IMAGE_URI_LATEST}" ]]; then
+          echo "::error::Image URI mismatch. Expected ${IMAGE_URI_LATEST}, got ${CURRENT_IMAGE_URI}"
+          exit 1
+        fi
+        echo "Image URI verification passed."
+
+    - name: Ensure Lambda Function URL exists
+      id: function-url
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Reuse existing function URL or create one on demand.
+        FUNCTION_URL="$(
+          aws lambda get-function-url-config \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'FunctionUrl' \
+            --output text 2>/dev/null || true
+        )"
+
+        if [[ -z "${FUNCTION_URL}" || "${FUNCTION_URL}" == "None" ]]; then
+          echo "Function URL not found. Creating with auth type AWS_IAM..."
+          FUNCTION_URL="$(
+            aws lambda create-function-url-config \
+              --function-name "${FUNCTION_NAME}" \
+              --auth-type "AWS_IAM" \
+              --region "${AWS_REGION}" \
+              --query 'FunctionUrl' \
+              --output text
+          )"
+        else
+          echo "Function URL exists: ${FUNCTION_URL}"
+        fi
+
+        if [[ -z "${FUNCTION_URL}" || "${FUNCTION_URL}" == "None" ]]; then
+          echo "::error::Failed to resolve Lambda Function URL."
+          exit 1
+        fi
+
+        echo "FUNCTION_URL=${FUNCTION_URL}" >> "${GITHUB_ENV}"
+        echo "lambda_url=${FUNCTION_URL}" >> "${GITHUB_OUTPUT}"
+        echo "Lambda Function URL: ${FUNCTION_URL}"
+
+    - name: Interface summary
+      id: summary
+      shell: bash
+      run: |
+        # Keep key values in logs and expose final URL to caller workflow.
+        echo "target_directory=${DOCKER_BUILD_CONTEXT}"
+        echo "function_name=${FUNCTION_NAME}"
+        echo "image_repository=${IMAGE_REPOSITORY}"
+        echo "aws_region=${AWS_REGION}"
+        echo "aws_account_id=${AWS_ACCOUNT_ID}"
+        echo "deployment_role_name=${DEPLOYMENT_ROLE_NAME}"
+        echo "execution_role_name=${EXECUTION_ROLE_NAME}"
+        echo "architecture=${ARCHITECTURE}"
+        echo "dockerfile_path=${DOCKERFILE_PATH}"
+        echo "image_uri_latest=${IMAGE_URI_LATEST}"
+        echo "image_uri_sha=${IMAGE_URI_SHA}"
+        echo "lambda_url=${FUNCTION_URL}" >> "$GITHUB_OUTPUT"
+        echo "api_gateway_url=${API_GATEWAY_URL:-}" >> "$GITHUB_OUTPUT"
