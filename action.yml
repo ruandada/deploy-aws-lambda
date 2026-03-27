@@ -104,6 +104,16 @@ runs:
         architecture = get_value("Architecture", default="x86_64")
         dockerfile_path = get_value("DockerfilePath", default="Dockerfile")
         api_gateway_name = get_value("ApiGatewayName", default=f"{function_name}-http-api")
+        enable_api_gateway_raw = get_value("EnableApiGateway", default="")
+        if not enable_api_gateway_raw:
+            # Backward compatibility for misspelled key used in some configs.
+            enable_api_gateway_raw = get_value("EnableApiGatway", default="true")
+        enable_api_gateway = str(enable_api_gateway_raw).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         env_lines = {
             "FUNCTION_NAME": function_name,
@@ -116,6 +126,7 @@ runs:
             "ARCHITECTURE": architecture,
             "DOCKERFILE_PATH": dockerfile_path,
             "API_GATEWAY_NAME": api_gateway_name,
+            "ENABLE_API_GATEWAY": "true" if enable_api_gateway else "false",
             "DEPLOYMENT_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{deployment_role_name}",
             "EXECUTION_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{execution_role_name}",
         }
@@ -352,6 +363,7 @@ runs:
         fi
 
     - name: Ensure API Gateway trigger exists
+      if: ${{ env.ENABLE_API_GATEWAY == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
