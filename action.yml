@@ -23,9 +23,6 @@ outputs:
   lambda-url:
     description: Lambda Function URL
     value: ${{ steps.summary.outputs.lambda_url }}
-  api-gateway-url:
-    description: API Gateway HTTP API endpoint
-    value: ${{ steps.summary.outputs.api_gateway_url }}
 
 runs:
   using: composite
@@ -103,18 +100,6 @@ runs:
         execution_role_name = get_value("ExecutionRoleName", required=True)
         architecture = get_value("Architecture", default="x86_64")
         dockerfile_path = get_value("DockerfilePath", default="Dockerfile")
-        api_gateway_name = get_value("ApiGatewayName", default=f"{function_name}-http-api")
-        enable_api_gateway_raw = get_value("EnableApiGateway", default="")
-        if not enable_api_gateway_raw:
-            # Backward compatibility for misspelled key used in some configs.
-            enable_api_gateway_raw = get_value("EnableApiGatway", default="true")
-        enable_api_gateway = str(enable_api_gateway_raw).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
         env_lines = {
             "FUNCTION_NAME": function_name,
             "IMAGE_REPOSITORY": image_repository,
@@ -125,8 +110,6 @@ runs:
             "EXECUTION_ROLE_NAME": execution_role_name,
             "ARCHITECTURE": architecture,
             "DOCKERFILE_PATH": dockerfile_path,
-            "API_GATEWAY_NAME": api_gateway_name,
-            "ENABLE_API_GATEWAY": "true" if enable_api_gateway else "false",
             "DEPLOYMENT_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{deployment_role_name}",
             "EXECUTION_ROLE_ARN": f"arn:aws:iam::{aws_account_id}:role/{execution_role_name}",
         }
@@ -377,65 +360,6 @@ runs:
           echo "Lambda create completed and function is active."
         fi
 
-    - name: Ensure API Gateway trigger exists
-      if: ${{ env.ENABLE_API_GATEWAY == 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        # Idempotent behavior: if API exists by name, skip creation.
-        API_ID="$(
-          aws apigatewayv2 get-apis \
-            --region "${AWS_REGION}" \
-            --query "Items[?Name==\`${API_GATEWAY_NAME}\`].ApiId | [0]" \
-            --output text
-        )"
-
-        if [[ -n "${API_ID}" && "${API_ID}" != "None" ]]; then
-          echo "API Gateway exists, skip creating trigger: ${API_GATEWAY_NAME} (${API_ID})"
-          API_ENDPOINT="$(
-            aws apigatewayv2 get-api \
-              --api-id "${API_ID}" \
-              --region "${AWS_REGION}" \
-              --query 'ApiEndpoint' \
-              --output text
-          )"
-          echo "API_GATEWAY_URL=${API_ENDPOINT}" >> "${GITHUB_ENV}"
-          echo "API Endpoint: ${API_ENDPOINT}"
-          exit 0
-        fi
-
-        echo "Creating HTTP API Gateway trigger for Lambda: ${FUNCTION_NAME}"
-        API_ID="$(
-          aws apigatewayv2 create-api \
-            --name "${API_GATEWAY_NAME}" \
-            --protocol-type HTTP \
-            --target "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${FUNCTION_NAME}" \
-            --region "${AWS_REGION}" \
-            --query 'ApiId' \
-            --output text
-        )"
-
-        # Grant invoke permission to this new API.
-        aws lambda add-permission \
-          --function-name "${FUNCTION_NAME}" \
-          --statement-id "apigw-${API_ID}-invoke" \
-          --action "lambda:InvokeFunction" \
-          --principal apigateway.amazonaws.com \
-          --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/\$default" \
-          --region "${AWS_REGION}" >/dev/null
-
-        API_ENDPOINT="$(
-          aws apigatewayv2 get-api \
-            --api-id "${API_ID}" \
-            --region "${AWS_REGION}" \
-            --query 'ApiEndpoint' \
-            --output text
-        )"
-        echo "API_GATEWAY_URL=${API_ENDPOINT}" >> "${GITHUB_ENV}"
-        echo "Created API Gateway trigger: ${API_GATEWAY_NAME} (${API_ID})"
-        echo "API Endpoint: ${API_ENDPOINT}"
-
     - name: Verify deployed image URI
       shell: bash
       run: |
@@ -509,4 +433,3 @@ runs:
         echo "image_uri_latest=${IMAGE_URI_LATEST}"
         echo "image_uri_sha=${IMAGE_URI_SHA}"
         echo "lambda_url=${FUNCTION_URL}" >> "$GITHUB_OUTPUT"
-        echo "api_gateway_url=${API_GATEWAY_URL:-}" >> "$GITHUB_OUTPUT"
